@@ -12,6 +12,7 @@ import base64
 from pathlib import Path
 import os
 from dotenv import load_dotenv
+import time
 
 # Load environment variables
 load_dotenv()
@@ -19,14 +20,75 @@ load_dotenv()
 # --------------------------------------------------------------------------------
 # Configuration and Settings
 # --------------------------------------------------------------------------------
-REGION = os.getenv('AWS_REGION', 'us-east-1')
-AGENT_ALIAS_ID = os.getenv('AWS_AGENT_ALIAS_ID', '')
-AGENT_ID = os.getenv('AWS_AGENT_ID', '')
-S3_BUCKET = os.getenv('AWS_S3_BUCKET', 'brandbyme1')
+def get_aws_config():
+    """Get AWS configuration from secrets or environment variables"""
+    try:
+        aws_config = {
+            "region": st.secrets["aws_credentials"]["AWS_DEFAULT_REGION"],
+            "access_key": st.secrets["aws_credentials"]["AWS_ACCESS_KEY_ID"],
+            "secret_key": st.secrets["aws_credentials"]["AWS_SECRET_ACCESS_KEY"],
+            "agent_alias_id": st.secrets["aws_credentials"]["AWS_AGENT_ALIAS_ID"],
+            "agent_id": st.secrets["aws_credentials"]["AWS_AGENT_ID"]
+        }
+    except Exception as e:
+        st.error(f"Failed to load AWS configuration: {str(e)}")
+        return None
+    return aws_config
+
+# Get AWS configuration
+AWS_CONFIG = get_aws_config()
+if AWS_CONFIG:
+    REGION = AWS_CONFIG["region"]
+    AGENT_ALIAS_ID = AWS_CONFIG["agent_alias_id"]
+    AGENT_ID = AWS_CONFIG["agent_id"]
+    S3_BUCKET = 'brandbyme1'
+else:
+    st.error("Failed to load AWS configuration. Please check your settings.")
+    st.stop()
 
 # Get the absolute path to the assets directory
 ASSETS_DIR = Path(__file__).parent / 'assets'
 LOGO_PATH = str(ASSETS_DIR / 'logo.png')
+
+def verify_aws_credentials():
+    """Verify AWS credentials and permissions"""
+    try:
+        if not AWS_CONFIG:
+            return False
+
+        # Test AWS STS access
+        sts = boto3.client(
+            'sts',
+            aws_access_key_id=AWS_CONFIG["access_key"],
+            aws_secret_access_key=AWS_CONFIG["secret_key"],
+            region_name=AWS_CONFIG["region"]
+        )
+        
+        identity = sts.get_caller_identity()
+        st.sidebar.success(f"✅ AWS Connected: {identity['Arn']}")
+        
+        # Test Bedrock access
+        bedrock_agent_runtime = boto3.client(
+            service_name="bedrock-agent-runtime",
+            region_name=AWS_CONFIG["region"],
+            aws_access_key_id=AWS_CONFIG["access_key"],
+            aws_secret_access_key=AWS_CONFIG["secret_key"]
+        )
+        
+        # Verify S3 access
+        s3 = boto3.client(
+            's3',
+            region_name=AWS_CONFIG["region"],
+            aws_access_key_id=AWS_CONFIG["access_key"],
+            aws_secret_access_key=AWS_CONFIG["secret_key"]
+        )
+        s3.head_bucket(Bucket=S3_BUCKET)
+        
+        return True
+        
+    except Exception as e:
+        st.sidebar.error(f"AWS Authentication Error: {str(e)}")
+        return False
 
 def preprocess_url(url: str) -> str:
     """Preprocess URL to ensure proper format"""
@@ -133,61 +195,85 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 def call_bedrock_agent(prompt: str) -> dict:
-    """Enhanced Bedrock Agent caller with JSON response parsing"""
+    """Enhanced Bedrock Agent caller with improved error handling"""
     try:
-        # Get AWS credentials from environment variables or Streamlit secrets
-        aws_access_key = os.getenv('AWS_ACCESS_KEY_ID') or st.secrets["aws_credentials"]["AWS_ACCESS_KEY_ID"]
-        aws_secret_key = os.getenv('AWS_SECRET_ACCESS_KEY') or st.secrets["aws_credentials"]["AWS_SECRET_ACCESS_KEY"]
+        if not AWS_CONFIG:
+            return {
+                "success": False,
+                "message": "AWS configuration not available",
+                "data": None
+            }
+
+        # Add debug information
+        st.sidebar.info("🔄 Connecting to Bedrock...")
         
         bedrock_agent_runtime = boto3.client(
             service_name="bedrock-agent-runtime",
-            region_name=REGION,
-            aws_access_key_id=aws_access_key,
-            aws_secret_access_key=aws_secret_key
+            region_name=AWS_CONFIG["region"],
+            aws_access_key_id=AWS_CONFIG["access_key"],
+            aws_secret_access_key=AWS_CONFIG["secret_key"]
         )
         
-        response = bedrock_agent_runtime.invoke_agent(
-            agentAliasId=AGENT_ALIAS_ID,
-            agentId=AGENT_ID,
-            sessionId=str(random.randint(1, 1000000)),
-            inputText=prompt,
-            enableTrace=True
-        )
+        # Add retry logic
+        max_retries = 3
+        retry_delay = 1  # seconds
         
-        # Parse the response
-        full_response = ""
-        for event in response["completion"]:
-            if "chunk" in event:
-                chunk = event["chunk"]
-                if "bytes" in chunk:
-                    full_response += chunk["bytes"].decode("utf-8")
-        
-        # Try to parse JSON from the response
-        try:
-            response_data = json.loads(full_response)
-            if isinstance(response_data, dict) and "response" in response_data:
-                function_response = response_data["response"]["functionResponse"]
-                if "responseBody" in function_response:
-                    if "TEXT" in function_response["responseBody"]:
-                        text_response = function_response["responseBody"]["TEXT"]["body"]
-                        return {
-                            "success": True,
-                            "message": text_response,
-                            "data": None
-                        }
-        except json.JSONDecodeError:
-            pass
-        
-        return {
-            "success": True,
-            "message": full_response,
-            "data": None
-        }
-        
+        for attempt in range(max_retries):
+            try:
+                response = bedrock_agent_runtime.invoke_agent(
+                    agentAliasId=AWS_CONFIG["agent_alias_id"],
+                    agentId=AWS_CONFIG["agent_id"],
+                    sessionId=str(random.randint(1, 1000000)),
+                    inputText=prompt,
+                    enableTrace=True
+                )
+                
+                # Clear the connecting message
+                st.sidebar.empty()
+                
+                # Parse the response
+                full_response = ""
+                for event in response["completion"]:
+                    if "chunk" in event:
+                        chunk = event["chunk"]
+                        if "bytes" in chunk:
+                            full_response += chunk["bytes"].decode("utf-8")
+                
+                # Try to parse JSON from the response
+                try:
+                    response_data = json.loads(full_response)
+                    if isinstance(response_data, dict) and "response" in response_data:
+                        function_response = response_data["response"]["functionResponse"]
+                        if "responseBody" in function_response:
+                            if "TEXT" in function_response["responseBody"]:
+                                text_response = function_response["responseBody"]["TEXT"]["body"]
+                                return {
+                                    "success": True,
+                                    "message": text_response,
+                                    "data": None
+                                }
+                except json.JSONDecodeError:
+                    pass
+                
+                return {
+                    "success": True,
+                    "message": full_response,
+                    "data": None
+                }
+                
+            except boto3.exceptions.Boto3Error as e:
+                if attempt < max_retries - 1:
+                    st.sidebar.warning(f"Retrying... Attempt {attempt + 1}/{max_retries}")
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    raise e
+                    
     except Exception as e:
+        st.sidebar.error("❌ Bedrock connection failed")
         return {
             "success": False,
-            "message": str(e),
+            "message": f"Failed to connect to Bedrock: {str(e)}",
             "data": None
         }
 
@@ -202,7 +288,7 @@ def initialize_chat_history():
         st.session_state.messages = []
 
 def display_media_section(media_items):
-    """Display media items in a grid"""
+    """Display media items in a grid with enhanced image handling"""
     if not media_items:
         st.write("No media found")
         return
@@ -215,13 +301,27 @@ def display_media_section(media_items):
             if i + j < len(media_items):
                 with cols[j]:
                     try:
-                        st.image(
-                            media_items[i + j]['url'],
-                            caption=media_items[i + j]['alt'] if media_items[i + j]['alt'] else f"Image {i + j + 1}",
-                            use_container_width=True
-                        )
+                        image_url = media_items[i + j]['url']
+                        
+                        # Skip base64 encoded images and show placeholder
+                        if image_url.startswith('data:'):
+                            st.image(
+                                "https://via.placeholder.com/300x200",
+                                caption=f"{media_items[i + j]['alt']} (Placeholder)" if media_items[i + j]['alt'] else f"Image {i + j + 1} (Placeholder)",
+                                use_container_width=True
+                            )
+                        else:
+                            st.image(
+                                image_url,
+                                caption=media_items[i + j]['alt'] if media_items[i + j]['alt'] else f"Image {i + j + 1}",
+                                use_container_width=True
+                            )
                     except Exception as e:
-                        st.warning(f"Unable to load image: {media_items[i + j]['url']}")
+                        st.warning(f"Unable to load image: {str(e)}")
+
+    # Add note about placeholders if any were found
+    if any(item['url'].startswith('data:') for item in media_items):
+        st.info("💡 Some images are showing as placeholders because the actual images haven't been loaded yet or are not accessible.")
 
 def display_structured_content(content):
     """Display structured content with proper formatting"""
@@ -237,16 +337,15 @@ def display_structured_content(content):
                 st.markdown(f"- {list_item}")
 
 def get_s3_analysis_history():
-    """Fetch analysis history from S3"""
+    """Fetch analysis history from S3 with better error handling"""
     try:
-        # Get AWS credentials from environment variables or Streamlit secrets
-        aws_access_key = os.getenv('AWS_ACCESS_KEY_ID') or st.secrets["aws_credentials"]["AWS_ACCESS_KEY_ID"]
-        aws_secret_key = os.getenv('AWS_SECRET_ACCESS_KEY') or st.secrets["aws_credentials"]["AWS_SECRET_ACCESS_KEY"]
-        
+        if not AWS_CONFIG:
+            return []
+            
         s3 = boto3.client('s3', 
-                         region_name=REGION,
-                         aws_access_key_id=aws_access_key,
-                         aws_secret_access_key=aws_secret_key)
+                         region_name=AWS_CONFIG["region"],
+                         aws_access_key_id=AWS_CONFIG["access_key"],
+                         aws_secret_access_key=AWS_CONFIG["secret_key"])
                          
         response = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix="scraped-data/")
         if 'Contents' in response:
@@ -296,7 +395,7 @@ def display_analysis_results(data: Dict[str, Any]):
         display_structured_content(data.get('structured_content', []))
 
 def handle_predefined_question(question: str):
-    """Handle predefined question clicks"""
+    """Handle predefined question clicks with error handling"""
     st.session_state.messages.append({"role": "user", "content": question})
     with st.chat_message("user"):
         st.markdown(question)
@@ -307,9 +406,14 @@ def handle_predefined_question(question: str):
             st.markdown(response["message"])
             st.session_state.messages.append({"role": "assistant", "content": response["message"]})
         else:
-            st.error("Failed to get response")
+            st.error(f"Failed to get response: {response['message']}")
 
 def main():
+    # Verify AWS credentials before starting
+    if not verify_aws_credentials():
+        st.error("Failed to verify AWS credentials. Please check your configuration.")
+        st.stop()
+        
     initialize_chat_history()
     
     # Add a sidebar with logo
@@ -398,14 +502,10 @@ def main():
             
             if selected_analysis:
                 try:
-                    # Get AWS credentials
-                    aws_access_key = os.getenv('AWS_ACCESS_KEY_ID') or st.secrets["aws_credentials"]["AWS_ACCESS_KEY_ID"]
-                    aws_secret_key = os.getenv('AWS_SECRET_ACCESS_KEY') or st.secrets["aws_credentials"]["AWS_SECRET_ACCESS_KEY"]
-                    
                     s3 = boto3.client('s3', 
-                                    region_name=REGION,
-                                    aws_access_key_id=aws_access_key,
-                                    aws_secret_access_key=aws_secret_key)
+                                    region_name=AWS_CONFIG["region"],
+                                    aws_access_key_id=AWS_CONFIG["access_key"],
+                                    aws_secret_access_key=AWS_CONFIG["secret_key"])
                     
                     obj = s3.get_object(Bucket=S3_BUCKET, Key=selected_analysis)
                     analysis_data = json.loads(obj['Body'].read().decode('utf-8'))
@@ -483,7 +583,7 @@ def main():
                     st.markdown(response["message"])
                     st.session_state.messages.append({"role": "assistant", "content": response["message"]})
                 else:
-                    st.error("Failed to get response")
+                    st.error(f"Failed to get response: {response['message']}")
 
     with tabs[3]:
         st.header("About DISMANTLE AI")
