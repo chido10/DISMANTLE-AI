@@ -92,41 +92,6 @@ def load_local_image(image_path):
         st.error(f"Error loading image: {str(e)}")
         return None
 
-# App configuration
-st.set_page_config(
-    page_title="DISMANTLE AI",
-    page_icon="🔍",
-    layout="wide",
-    initial_sidebar_state="expanded",
-    menu_items={
-        "Get Help": "https://www.dismantleai.com/help",
-        "Report a bug": "https://www.dismantleai.com/bug",
-        "About": "# DISMANTLE AI\nAn anti-racism content audit tool.",
-    },
-)
-
-# Custom CSS
-st.markdown(
-    """
-    <style>
-    .stApp {
-        max-width: 100%;
-        padding: 1rem;
-    }
-    .main {
-        background-color: #f5f5f5;
-    }
-    .stButton>button {
-        background-color: #FF4B4B;
-        color: white;
-        border-radius: 5px;
-        padding: 0.5rem 1rem;
-    }
-    </style>
-""",
-    unsafe_allow_html=True,
-)
-
 def call_bedrock_agent(prompt: str) -> dict:
     """Enhanced Bedrock Agent caller with JSON response parsing"""
     try:
@@ -174,13 +139,63 @@ def get_s3_analysis_history():
         st.error(f"Failed to fetch analysis history: {str(e)}")
     return []
 
-def main():
-    st.sidebar.image(load_local_image(LOGO_PATH), use_column_width=True)
-    st.sidebar.title("DISMANTLE AI")
+def display_analysis_results(data: Dict[str, Any]):
+    """Enhanced display of analysis results"""
+    st.header("📊 Analysis Results")
 
+    # Basic Information with enhanced metrics
+    with st.expander("📌 Basic Information", expanded=True):
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Images", data["metadata"]["image_count"], delta="found" if data["metadata"]["image_count"] > 0 else "none")
+        with col2:
+            st.metric("Paragraphs", data["metadata"]["paragraph_count"])
+        with col3:
+            st.metric("Headers", len(data["metadata"]["headers"]))
+        with col4:
+            st.metric("Analysis Date", data.get("timestamp", "N/A")[:10])
+
+        st.markdown(f"""
+        **URL:** [{data['url']}]({data['url']})  
+        **Title:** {data['title']}
+        """)
+
+    # Media Section with download option
+    with st.expander("📸 Media Gallery", expanded=True):
+        if data.get("media"):
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                st.image([m["url"] for m in data["media"]], use_column_width=True)
+            with col2:
+                st.download_button(
+                    label="Download Media List",
+                    data=json.dumps([m["url"] for m in data["media"]], indent=2),
+                    file_name="media_urls.json",
+                    mime="application/json",
+                )
+
+    # Content Structure
+    with st.expander("📝 Content Structure", expanded=True):
+        st.json(data.get("structured_content", {}))
+
+def main():
+    initialize_chat_history()
+
+    # Sidebar Logo and Title
+    with st.sidebar:
+        logo_image = load_local_image(LOGO_PATH)
+        if logo_image:
+            st.markdown(
+                f'<img src="{logo_image}" style="width: 100%; margin-bottom: 20px;">',
+                unsafe_allow_html=True,
+            )
+        st.title("DISMANTLE AI")
+        st.markdown("---")
+
+    # Main content
     st.header("Welcome to DISMANTLE AI")
-    st.write("Analyze websites and detect anti-racism indicators.")
-    st.write("---")
+    st.write("Analyze websites for anti-racism indicators.")
+    st.markdown("---")
 
 if __name__ == "__main__":
     main()
